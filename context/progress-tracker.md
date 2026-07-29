@@ -6,7 +6,9 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 
 ---
 
-## 2026-07-23
+## 2026-07-28
+
+- Added `lint:check` script to package.json (ESLint with `--max-warnings=0`, no `--fix`) and a Lint step to CI after Install dependencies, so `no-explicit-any` is enforced on every PR. The existing `lint` script with `--fix` is unchanged for local use.
 
 - Added GitHub Actions health check workflow (`health-check.yml`) to ping the Render API every 6 hours to prevent the free tier instance from sleeping. Auto-creates or comments on issues with the `incident` label if the ping fails, preventing silent outages.
 - Documented the ping URL and incident label in README.
