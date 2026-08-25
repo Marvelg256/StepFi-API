@@ -6,6 +6,39 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 
 ---
 
+## 2026-08-25
+
+- Secured `POST /transactions/submit` (#117):
+  - **Source binding** — the authenticated wallet must be the transaction
+    source account (or the inner source for fee-bump transactions), or must
+    appear as an authorized address in the Soroban invocation auth. Third-party
+    XDR where the wallet is neither source nor authorizer is rejected with
+    `TRANSACTION_SOURCE_MISMATCH`. (Deposit/withdraw/repay/vendor XDRs built
+    by this API use a random source account and authorize via Soroban auth, so
+    the auth check keeps those flows working.)
+  - **Operation allowlist per type** — every operation must be a Soroban
+    `invokeHostFunction` whose function name matches the declared type
+    (`create_loan`, `repay_loan`/`repay_installment`, `deposit`, `withdraw`,
+    `approve_vendor`, `suspend_vendor`) and, when configured, must target the
+    contract owned by that flow. Rejections use `TRANSACTION_TYPE_MISMATCH` /
+    `TRANSACTION_OPERATION_NOT_ALLOWED`.
+  - **Idempotency** — migration
+    `20260825000001_add_unique_transaction_hash.sql` adds partial unique
+    indexes on `transaction_hash` and `hash` (with pre-existing row dedupe);
+    the service checks for an existing record before submitting and returns it
+    (`duplicate: true`) instead of re-submitting, with the unique-constraint
+    violation as the concurrency backstop.
+  - **Rate limits** — `WalletThrottlerGuard` keys `@nestjs/throttler` on the
+    authenticated wallet; the submit route is limited to 10 req / 60 s per
+    wallet AND per IP (global guard), matching the auth-endpoint pattern.
+  - **Persistence-first** — the local record is written (await) before the
+    Horizon submission, so persistence failures surface as
+    `TRANSACTION_PERSISTENCE_FAILED` instead of being silently dropped, and
+    the transaction hash is always known to the status checker / indexer.
+  - Updated `SubmitTransactionResponseDto` (`status` may reflect the recorded
+    status, plus `duplicate` flag), controller Swagger, and unit tests covering
+    every rejection branch plus the happy path.
+
 ## 2026-07-23
 
 - Added GitHub Actions health check workflow (`health-check.yml`) to ping the Render API every 6 hours to prevent the free tier instance from sleeping. Auto-creates or comments on issues with the `incident` label if the ping fails, preventing silent outages.

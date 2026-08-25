@@ -21,6 +21,11 @@ import { SubmitTransactionResponseDto } from './dto/submit-transaction-response.
 import { TransactionStatusResponseDto } from './dto/transaction-status-response.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Throttle } from '@nestjs/throttler';
+import { WalletThrottlerGuard } from './wallet-throttler.guard';
+
+const SUBMIT_RATE_LIMIT = 10;
+const SUBMIT_RATE_TTL_MS = 60000;
 
 @ApiTags('transactions')
 @Controller('transactions')
@@ -31,20 +36,28 @@ export class TransactionsController {
 
   @Post('submit')
   @HttpCode(HttpStatus.OK)
-  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { limit: SUBMIT_RATE_LIMIT, ttl: SUBMIT_RATE_TTL_MS } })
+  @UseGuards(JwtAuthGuard, WalletThrottlerGuard)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Submit a signed XDR transaction to the Stellar network',
     description:
-      'Validates the XDR format, submits the signed transaction to the Stellar network via Horizon API, stores the transaction hash with pending status in the database, and returns the hash immediately without waiting for confirmation.',
+      'Validates that the XDR source account (or Soroban authorization) matches the authenticated wallet and that the operations match the declared type, then persists the transaction record and submits the signed transaction to the Stellar network via Horizon. Returns the hash immediately without waiting for confirmation. Submission is idempotent per transaction hash: re-submitting an already recorded hash returns the original record. Rate limited per wallet and per IP.',
   })
   @ApiResponse({
     status: 200,
-    description: 'Transaction submitted successfully — hash returned with pending status',
+    description:
+      'Transaction submitted successfully — hash returned with pending status (or the original record when the hash was already submitted)',
     type: SubmitTransactionResponseDto,
   })
-  @ApiResponse({ status: 400, description: 'Malformed XDR, invalid signature, or Stellar rejection' })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Malformed XDR, source account mismatch (TRANSACTION_SOURCE_MISMATCH), operation/type mismatch (TRANSACTION_TYPE_MISMATCH, TRANSACTION_OPERATION_NOT_ALLOWED), or Stellar rejection',
+  })
   @ApiResponse({ status: 401, description: 'Unauthorized - missing or invalid JWT' })
+  @ApiResponse({ status: 429, description: 'Too many requests - rate limit exceeded (per wallet or per IP)' })
+  @ApiResponse({ status: 500, description: 'Failed to persist the transaction record locally (TRANSACTION_PERSISTENCE_FAILED)' })
   @ApiResponse({ status: 503, description: 'Stellar network temporarily unavailable' })
   async submitTransaction(
     @CurrentUser() user: { wallet: string },
