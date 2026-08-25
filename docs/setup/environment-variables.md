@@ -75,6 +75,39 @@ JWT_REFRESH_EXPIRATION=7d
 NONCE_EXPIRATION=300
 ```
 
+### Wallet Signature Challenges (issue #118)
+
+Wallet authentication is bound to a canonical, domain-scoped challenge
+envelope signed by the wallet (see `docs/api/endpoints.md`). The envelope's
+`domain`, `uri` and `networkPassphrase` fields are derived from these
+variables; a signature bound to a different environment is rejected.
+
+```env
+# Base URL of the API. Used to derive the challenge envelope's `uri` field
+# (and the `domain` field when AUTH_CHALLENGE_DOMAIN is unset).
+API_URL=https://stepfi-api.onrender.com
+
+# Optional: exact host embedded in the challenge envelope's `domain` field.
+# Defaults to the host of API_URL. Must match the public origin clients
+# reach this API from.
+AUTH_CHALLENGE_DOMAIN=stepfi-api.onrender.com
+
+# Whether the deprecated legacy raw-nonce signature scheme (signature over
+# the bare nonce hex, no domain binding) is still accepted. Defaults to true
+# during the documented migration window; MUST be set to false after the
+# sunset date (2026-10-31). When false, legacy requests fail with
+# AUTH_LEGACY_SIGNATURE_DISABLED.
+AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true
+```
+
+**Migration window**: existing mobile clients sign the bare nonce. They must
+be updated to sign the canonical challenge envelope returned by
+`POST /auth/nonce` (`signatureType: "envelope"`). Until the sunset date
+(**2026-10-31**) the legacy scheme remains accepted while
+`AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true`; after that date the flag must be
+flipped to `false` (or removed) and only domain-bound signatures are
+accepted.
+
 ### Redis (Caching)
 
 ```env

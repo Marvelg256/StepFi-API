@@ -6,6 +6,33 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 
 ---
 
+## 2026-08-25
+
+- Fixed cross-service signature replay (#118): `verifySignature()` now accepts
+  exactly one scheme per request and every accepted signature provably signs a
+  StepFi-bound challenge.
+  - `generateNonce()` issues a canonical challenge envelope (domain, address,
+    statement, uri, version, nonce, issuedAt, expirationTime,
+    networkPassphrase) and stores a SHA-256 digest of the exact message on the
+    nonce row (`issued_at`, `message_hash` columns via migration
+    `20260825000000_add_nonce_message_binding.sql`).
+  - Verification runs only against a message whose digest matches the stored
+    challenge hash (`AUTH_CHALLENGE_MISMATCH` otherwise), with strict
+    domain/URI/network/expiry checks (`AUTH_CHALLENGE_DOMAIN_MISMATCH`,
+    `AUTH_CHALLENGE_URI_MISMATCH`, `AUTH_CHALLENGE_NETWORK_MISMATCH`,
+    `AUTH_NONCE_EXPIRED`). The old "try raw, then 'Stellar Signing Key: '"
+    fallback is gone — the weakest format no longer defines the security floor.
+  - Browser wallets verify per SEP-53 (SHA-256 of
+    "Stellar Signed Message:\n" + envelope, `signatureType: 'sep0043'`);
+    native clients sign the envelope with raw Ed25519
+    (`signatureType: 'envelope'`).
+  - The legacy raw-nonce scheme is deprecated behind
+    `AUTH_ALLOW_LEGACY_RAW_SIGNATURES` (default true for mobile-client
+    compatibility) with a documented sunset date of **2026-10-31**; when
+    disabled, legacy requests fail with `AUTH_LEGACY_SIGNATURE_DISABLED`.
+  - Added `AUTH_CHALLENGE_DOMAIN` env (defaults to `API_URL` host); envelope
+    `uri` is derived from `API_URL` + `API_PREFIX`.
+
 ## 2026-07-23
 
 - Added GitHub Actions health check workflow (`health-check.yml`) to ping the Render API every 6 hours to prevent the free tier instance from sleeping. Auto-creates or comments on issues with the `incident` label if the ping fails, preventing silent outages.
