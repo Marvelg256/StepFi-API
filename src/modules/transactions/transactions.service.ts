@@ -165,8 +165,9 @@ export class TransactionsService {
     // 4. Persist first so persistence failures surface instead of being
     //    silently dropped. The unique hash indexes backstop the check above
     //    against concurrent duplicate submissions.
+    let lookupColumn: TransactionLookupColumn | null = null;
     try {
-      await this.persistTransactionRecord(wallet, transactionHash, dto.type, dto.xdr);
+      lookupColumn = await this.persistTransactionRecord(wallet, transactionHash, dto.type, dto.xdr);
     } catch (error) {
       if (this.isUniqueViolationError(error)) {
         const existingAfterRace = await this.findTransactionRecord(transactionHash);
@@ -187,9 +188,14 @@ export class TransactionsService {
 
     // 5. Submit to Horizon only after the local record exists, so the
     //    transaction hash is always known to the status checker / indexer.
+    //    When Horizon rejects the transaction (or submission fails
+    //    unexpectedly), the persisted record is marked failed so it does not
+    //    linger as a stale `pending` row attributable to the submitting
+    //    wallet.
     try {
       await this.horizonServer.submitTransaction(transaction);
     } catch (error) {
+      await this.markTransactionFailed(lookupColumn, transactionHash, error);
       this.handleHorizonError(error);
     }
 
@@ -291,8 +297,29 @@ export class TransactionsService {
         });
       }
 
+      // Fail closed on the contract ID: the allowlist never degrades to
+      // function-name-only matching. If the contract for this flow is not
+      // configured, submissions of this type are disabled rather than
+      // accepting invocations of attacker-deployed contracts whose functions
+      // share StepFi names.
       const expectedContractId = this.configService.get<string>(allowlist.contractIdKey);
-      if (expectedContractId && invocation.contractId && invocation.contractId !== expectedContractId.trim()) {
+      if (!expectedContractId) {
+        throw new ServiceUnavailableException({
+          code: 'TRANSACTION_CONTRACT_NOT_CONFIGURED',
+          message: `The contract for transaction type '${type}' is not configured on the server. Submission is disabled until the contract ID is set.`,
+        });
+      }
+
+      // The target contract must be determinable from the XDR — a matching
+      // function name is not enough.
+      if (!invocation.contractId) {
+        throw new BadRequestException({
+          code: 'TRANSACTION_TYPE_MISMATCH',
+          message: `Could not determine the target contract address for transaction type '${type}'.`,
+        });
+      }
+
+      if (invocation.contractId !== expectedContractId.trim()) {
         throw new BadRequestException({
           code: 'TRANSACTION_TYPE_MISMATCH',
           message: `Transaction type '${type}' must invoke contract ${expectedContractId}, but the XDR targets ${invocation.contractId}.`,
@@ -426,7 +453,17 @@ export class TransactionsService {
     return code === '23505' || message.includes('duplicate key value violates unique constraint');
   }
 
-  private handleHorizonError(error: unknown): never {
+  /**
+   * Maps a Horizon submission error to the HTTP status, typed code, and
+   * user-facing message that should be returned to the client. Shared by
+   * `handleHorizonError` (which throws) and `markTransactionFailed` (which
+   * records the same message on the local row).
+   */
+  private describeHorizonError(error: unknown): {
+    httpStatus: number;
+    code: string;
+    message: string;
+  } {
     const err = error as {
       response?: { data?: { extras?: { result_codes?: { transaction?: string; operations?: string[] } } } };
       message?: string;
@@ -441,32 +478,94 @@ export class TransactionsService {
 
       for (const code of allCodes) {
         if (code && HORIZON_ERROR_MAP[code]) {
-          throw new BadRequestException({
+          return {
+            httpStatus: 400,
             code: `STELLAR_${code.toUpperCase()}`,
             message: HORIZON_ERROR_MAP[code],
-          });
+          };
         }
       }
 
-      throw new BadRequestException({
+      return {
+        httpStatus: 400,
         code: 'STELLAR_TRANSACTION_FAILED',
         message: `Transaction rejected by the Stellar network: ${allCodes.join(', ')}`,
-      });
+      };
     }
 
     const message = err?.message ?? 'Unknown error';
     if (message.toLowerCase().includes('timeout') || message.toLowerCase().includes('network')) {
-      throw new ServiceUnavailableException({
+      return {
+        httpStatus: 503,
         code: 'STELLAR_NETWORK_UNAVAILABLE',
         message: 'Stellar network is temporarily unavailable. Please try again later.',
-      });
+      };
     }
 
     this.logger.error(`Horizon submission error: ${message}`);
-    throw new InternalServerErrorException({
+    return {
+      httpStatus: 500,
       code: 'STELLAR_SUBMISSION_FAILED',
       message: 'Failed to submit transaction to the Stellar network. Please try again.',
-    });
+    };
+  }
+
+  private handleHorizonError(error: unknown): never {
+    const details = this.describeHorizonError(error);
+
+    if (details.httpStatus === 503) {
+      throw new ServiceUnavailableException({ code: details.code, message: details.message });
+    }
+    if (details.httpStatus === 500) {
+      throw new InternalServerErrorException({ code: details.code, message: details.message });
+    }
+    throw new BadRequestException({ code: details.code, message: details.message });
+  }
+
+  /**
+   * Best-effort update of the persisted record when Horizon rejected the
+   * transaction or submission failed unexpectedly, so the row does not linger
+   * as a stale `pending` record attributable to the submitting wallet. On
+   * transient network unavailability (503) the outcome is unknown — the
+   * transaction may still be in flight — so the row is left `pending` for the
+   * status checker to reconcile. Never throws: the original Horizon error is
+   * what surfaces to the client.
+   */
+  private async markTransactionFailed(
+    lookupColumn: TransactionLookupColumn | null,
+    hash: string,
+    error: unknown,
+  ): Promise<void> {
+    if (!lookupColumn) {
+      return;
+    }
+
+    const details = this.describeHorizonError(error);
+    if (details.httpStatus === 503) {
+      return;
+    }
+
+    try {
+      const failedAt = new Date().toISOString();
+      const client = this.supabaseService.getServiceRoleClient();
+      const { error: updateError } = await client
+        .from('transactions')
+        .update({
+          status: 'failed',
+          error: details.message,
+          completed_at: failedAt,
+          updated_at: failedAt,
+        })
+        .eq(lookupColumn, hash);
+
+      if (updateError) {
+        this.logger.warn(`Failed to mark transaction ${hash} as failed: ${updateError.message}`);
+      }
+    } catch (persistError) {
+      this.logger.warn(
+        `Failed to mark transaction ${hash} as failed: ${(persistError as Error).message}`,
+      );
+    }
   }
 
   private async persistTransactionRecord(
@@ -474,7 +573,7 @@ export class TransactionsService {
     hash: string,
     type: TransactionType,
     xdr: string,
-  ): Promise<void> {
+  ): Promise<TransactionLookupColumn> {
     const client = this.supabaseService.getServiceRoleClient();
     const submittedAt = new Date().toISOString();
     const transactionHashPayload: Record<string, unknown> = {
@@ -491,7 +590,7 @@ export class TransactionsService {
       .insert(transactionHashPayload);
 
     if (!transactionHashError) {
-      return;
+      return 'transaction_hash';
     }
 
     if (!this.isUnknownColumnError(transactionHashError)) {
@@ -512,6 +611,8 @@ export class TransactionsService {
     if (legacyHashError) {
       throw new Error(legacyHashError.message ?? 'Supabase insert failed');
     }
+
+    return 'hash';
   }
 
   private async findTransactionRecord(hash: string): Promise<TransactionRecord | null> {

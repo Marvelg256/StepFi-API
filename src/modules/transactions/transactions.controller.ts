@@ -57,8 +57,8 @@ export class TransactionsController {
   })
   @ApiResponse({ status: 401, description: 'Unauthorized - missing or invalid JWT' })
   @ApiResponse({ status: 429, description: 'Too many requests - rate limit exceeded (per wallet or per IP)' })
-  @ApiResponse({ status: 500, description: 'Failed to persist the transaction record locally (TRANSACTION_PERSISTENCE_FAILED)' })
-  @ApiResponse({ status: 503, description: 'Stellar network temporarily unavailable' })
+  @ApiResponse({ status: 500, description: 'Failed to persist the transaction record locally (TRANSACTION_PERSISTENCE_FAILED) or an unexpected Stellar submission failure (STELLAR_SUBMISSION_FAILED)' })
+  @ApiResponse({ status: 503, description: 'Stellar network temporarily unavailable, or the contract for the declared type is not configured on the server (TRANSACTION_CONTRACT_NOT_CONFIGURED)' })
   async submitTransaction(
     @CurrentUser() user: { wallet: string },
     @Body() dto: SubmitTransactionRequestDto,

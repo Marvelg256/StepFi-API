@@ -23,12 +23,21 @@ export enum TransactionType {
  * - The declared `type` must match the operations contained in the XDR
  *   (e.g. `deposit` must be a Soroban `deposit` invocation on the liquidity
  *   pool contract). Mismatches are rejected with `TRANSACTION_TYPE_MISMATCH`
- *   or `TRANSACTION_OPERATION_NOT_ALLOWED`.
+ *   or `TRANSACTION_OPERATION_NOT_ALLOWED`. The allowlist is fail-closed on
+ *   the contract ID: when the contract for the flow is not configured on the
+ *   server the submission is rejected with `TRANSACTION_CONTRACT_NOT_CONFIGURED`
+ *   (never falling back to function-name-only matching), and an invocation
+ *   whose target contract cannot be determined from the XDR is rejected with
+ *   `TRANSACTION_TYPE_MISMATCH`.
  * - Submission is idempotent per transaction hash: re-submitting an already
  *   recorded hash returns the original record without a second Horizon
  *   submission (`duplicate: true` on the response).
  * - The local record is persisted before the Horizon submission, so
  *   persistence failures surface as errors rather than being silently dropped.
+ *   When Horizon rejects the transaction (or submission fails unexpectedly),
+ *   the persisted record is marked `failed` with the mapped error message;
+ *   transient network unavailability leaves it `pending` for the status
+ *   checker to reconcile.
  */
 export class SubmitTransactionRequestDto {
   @ApiProperty({

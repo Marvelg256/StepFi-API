@@ -404,6 +404,7 @@ describe('TransactionsService', () => {
     contractId: string;
     authAddresses?: string[];
     hash?: string;
+    omitContractId?: boolean;
   }) {
     const auth = (opts.authAddresses ?? []).map((address) => ({
       credentials: () => ({
@@ -415,15 +416,20 @@ describe('TransactionsService', () => {
         }),
       }),
     }));
+    const attributes: Record<string, unknown> = {
+      functionName: { toString: () => opts.functionName },
+      auth,
+    };
+    if (!opts.omitContractId) {
+      attributes.contractAddress = Buffer.from(
+        StellarSdk.StrKey.decodeContract(opts.contractId),
+      );
+    }
     const operation = {
       type: 'invokeHostFunction',
       func: {
         _value: {
-          _attributes: {
-            functionName: { toString: () => opts.functionName },
-            contractAddress: Buffer.from(StellarSdk.StrKey.decodeContract(opts.contractId)),
-            auth,
-          },
+          _attributes: attributes,
         },
       },
     };
@@ -516,6 +522,47 @@ describe('TransactionsService', () => {
       ).rejects.toMatchObject({ response: { code: 'TRANSACTION_TYPE_MISMATCH' } });
 
       expect(mockSubmitTransaction).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when the contract ID for the declared type is not configured', async () => {
+      const xdr = buildSorobanXdr(walletKeypair, 'deposit', LIQUIDITY_CONTRACT_ID);
+      // The function name and source are valid, but the allowlist must not
+      // degrade to function-name-only matching when the contract ID is unset.
+      mockConfigService.get.mockImplementationOnce(() => undefined);
+
+      await expect(
+        service.submitTransaction(wallet, {
+          xdr,
+          type: 'deposit' as TransactionType,
+        }),
+      ).rejects.toMatchObject({ response: { code: 'TRANSACTION_CONTRACT_NOT_CONFIGURED' } });
+
+      expect(mockSubmitTransaction).not.toHaveBeenCalled();
+      expect(mockSupabaseTable.insert).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when the target contract address cannot be determined from the XDR', async () => {
+      const fakeTx = buildFakeSorobanTransaction({
+        source: wallet,
+        functionName: 'deposit',
+        contractId: LIQUIDITY_CONTRACT_ID,
+        omitContractId: true,
+      });
+      const fromXdrSpy = jest
+        .spyOn(StellarSdk.TransactionBuilder, 'fromXDR')
+        .mockReturnValue(fakeTx as any);
+
+      try {
+        await expect(
+          service.submitTransaction(wallet, {
+            xdr: 'AAAA',
+            type: 'deposit' as TransactionType,
+          }),
+        ).rejects.toMatchObject({ response: { code: 'TRANSACTION_TYPE_MISMATCH' } });
+        expect(mockSubmitTransaction).not.toHaveBeenCalled();
+      } finally {
+        fromXdrSpy.mockRestore();
+      }
     });
 
     it('rejects third-party XDR where the wallet is neither source nor authorizer', async () => {
@@ -697,6 +744,54 @@ describe('TransactionsService', () => {
       ).rejects.toMatchObject({
         response: { code: 'STELLAR_TX_BAD_AUTH' },
       });
+    });
+
+    it('marks the persisted record as failed when Horizon rejects the transaction', async () => {
+      const xdr = buildSorobanXdr(walletKeypair, 'deposit', LIQUIDITY_CONTRACT_ID);
+      mockSubmitTransaction.mockRejectedValue(
+        buildHorizonResultCodesError('tx_bad_auth'),
+      );
+
+      await expect(
+        service.submitTransaction(wallet, { xdr, type: 'deposit' as TransactionType }),
+      ).rejects.toMatchObject({ response: { code: 'STELLAR_TX_BAD_AUTH' } });
+
+      // The locally persisted pending row is updated to failed with the same
+      // message the client receives, so it does not linger as stale pending.
+      expect(mockSupabaseTable.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'failed',
+          error: 'Invalid transaction signature. Please re-sign and try again.',
+          completed_at: now,
+        }),
+      );
+      expect(mockSupabaseTable.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the record pending when Horizon is temporarily unavailable', async () => {
+      const xdr = buildSorobanXdr(walletKeypair, 'deposit', LIQUIDITY_CONTRACT_ID);
+      mockSubmitTransaction.mockRejectedValue(new Error('network timeout'));
+
+      await expect(
+        service.submitTransaction(wallet, { xdr, type: 'deposit' as TransactionType }),
+      ).rejects.toThrow(ServiceUnavailableException);
+
+      // The transaction may still be in flight — the row stays pending so the
+      // status checker can reconcile the truth.
+      expect(mockSupabaseTable.update).not.toHaveBeenCalled();
+    });
+
+    it('marks the persisted record as failed on an unexpected Horizon submission error', async () => {
+      const xdr = buildSorobanXdr(walletKeypair, 'deposit', LIQUIDITY_CONTRACT_ID);
+      mockSubmitTransaction.mockRejectedValue(new Error('something unexpected'));
+
+      await expect(
+        service.submitTransaction(wallet, { xdr, type: 'deposit' as TransactionType }),
+      ).rejects.toThrow(InternalServerErrorException);
+
+      expect(mockSupabaseTable.update).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'failed' }),
+      );
     });
 
     it('throws BadRequestException with STELLAR_TRANSACTION_FAILED for an unmapped result code', async () => {
