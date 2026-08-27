@@ -6,53 +6,33 @@ pure chore/docs commits). Direct pushes to main must also be logged here.
 
 ---
 
-## 2026-08-27
+## 2026-08-24
 
-- Closed the audit gaps on the #118 PR (#124): the legacy raw-nonce migration
-  window is now enforced at runtime, not just documented.
-  - Added `AUTH_LEGACY_SIGNATURES_SUNSET` (default `2026-10-31`): after the
-    cutoff, `verifyLegacyRawSignature()` rejects legacy raw-nonce signatures
-    with `AUTH_LEGACY_SIGNATURE_DISABLED` even while
-    `AUTH_ALLOW_LEGACY_RAW_SIGNATURES` is still true, so the replayable
-    scheme closes automatically on the sunset date — no manual ops action
-    required. Malformed sunset values fall back to the default rather than
-    silently disabling the cutoff.
-  - Strengthened the unit suite: the legacy-disabled regression test now
-    proves rejection happens before any signature verification (mock verify
-    returns true, assert it is never called), and new tests cover the
-    sunset cutoff (past sunset + flag true → rejected; future sunset +
-    flag true → accepted). Expired-envelope rejection unit test retained.
-  - Resolved the unresolved conflict markers (leftover wrong-repo
-    StepFi-Contracts content) that had been committed into
-    `context/progress-tracker.md`, which the PR audit flagged as merge
-    conflicts with the base branch.
+- **Session families + refresh-token replay detection** (`sessions.family_id`
+  migration, `fam` claim in refresh JWTs). Replaying an already-rotated
+  refresh token now revokes every session in the family and writes a
+  `auth.refresh_token_reuse` audit log entry — previously the first
+  presenter of a stolen token won silently. Legacy tokens without a `fam`
+  claim keep the old `AUTH_SESSION_NOT_FOUND` response.
+- **Blocked-user enforcement on every request**: new
+  `UserStatusService` (in-memory TTL cache) consulted by `JwtStrategy`.
+  Documented staleness bound: **30 seconds** — a blocked wallet loses API
+  access within ~30s of being blocked instead of retaining access until its
+  access token expires (up to 15 minutes). Cache is per-instance and fails
+  open on DB errors to avoid locking out all users during a DB blip.
+- **Session cleanup cron** (`src/jobs/session-cleanup/`, hourly,
+  mirrors nonce-cleanup): deletes only rows with `expires_at` older than
+  1 hour; sessions no longer accumulate forever.
+- Tests: refresh-family rotation, replay → family-wide revocation + audit
+  event, blocked-user denial within TTL bound, cache expiry re-query,
+  cleanup job deletes-only-expired.
 
-## 2026-08-25
+## 2026-08-26
 
-- Fixed cross-service signature replay (#118): `verifySignature()` now accepts
-  exactly one scheme per request and every accepted signature provably signs a
-  StepFi-bound challenge.
-  - `generateNonce()` issues a canonical challenge envelope (domain, address,
-    statement, uri, version, nonce, issuedAt, expirationTime,
-    networkPassphrase) and stores a SHA-256 digest of the exact message on the
-    nonce row (`issued_at`, `message_hash` columns via migration
-    `20260825000000_add_nonce_message_binding.sql`).
-  - Verification runs only against a message whose digest matches the stored
-    challenge hash (`AUTH_CHALLENGE_MISMATCH` otherwise), with strict
-    domain/URI/network/expiry checks (`AUTH_CHALLENGE_DOMAIN_MISMATCH`,
-    `AUTH_CHALLENGE_URI_MISMATCH`, `AUTH_CHALLENGE_NETWORK_MISMATCH`,
-    `AUTH_NONCE_EXPIRED`). The old "try raw, then 'Stellar Signing Key: '"
-    fallback is gone — the weakest format no longer defines the security floor.
-  - Browser wallets verify per SEP-53 (SHA-256 of
-    "Stellar Signed Message:\n" + envelope, `signatureType: 'sep0043'`);
-    native clients sign the envelope with raw Ed25519
-    (`signatureType: 'envelope'`).
-  - The legacy raw-nonce scheme is deprecated behind
-    `AUTH_ALLOW_LEGACY_RAW_SIGNATURES` (default true for mobile-client
-    compatibility) with a documented sunset date of **2026-10-31**; when
-    disabled, legacy requests fail with `AUTH_LEGACY_SIGNATURE_DISABLED`.
-  - Added `AUTH_CHALLENGE_DOMAIN` env (defaults to `API_URL` host); envelope
-    `uri` is derived from `API_URL` + `API_PREFIX`.
+- Fixed registration race conditions in `AuthService.register()` by eliminating application-side pre-checks (`findByWallet`, `checkUsernameExists`) and relying directly on DB-level UNIQUE constraints (`users.wallet_address`, `users.username`).
+- Added idempotent migration `20260826130000_ensure_users_unique_constraints.sql` to ensure unique indexes exist on `users.wallet_address` and `users.username`.
+- Updated `UsersRepository.createProfile()` to catch PostgreSQL unique constraint violation error `23505` and map to structured 409 `ConflictException` (`AUTH_WALLET_EXISTS`, `AUTH_USERNAME_TAKEN`).
+- Added cleanup handlers (`deleteAvatar`, `deleteUserById`) in `AuthService.register()` and `UsersRepository` to ensure failed registrations do not leave orphaned avatar files or partial user records.
 
 ## 2026-07-23
 
