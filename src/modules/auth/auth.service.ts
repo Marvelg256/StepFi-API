@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { Keypair, StrKey } from 'stellar-sdk';
 import { SupabaseService } from '../../database/supabase.client';
 import { UsersRepository, UploadedAvatarFile } from '../../database/repositories/users.repository';
@@ -21,64 +21,14 @@ import {
   REFRESH_TOKEN_EXPIRATION,
   REFRESH_TOKEN_EXPIRATION_MS,
 } from '../../config/jwt.config';
+import { AuditService } from '../admin/audit.service';
 
 const NONCE_EXPIRATION_SECONDS = 300;
 
-/**
- * Canonical prefix defined by SEP-53 ("Sign and Verify Messages"). Browser
- * wallets (Freighter etc.) sign SHA-256("Stellar Signed Message:\n" + message).
- */
-const SEP_53_PREFIX = 'Stellar Signed Message:\n';
-
-/** Version embedded in the canonical StepFi challenge envelope. */
-const CHALLENGE_VERSION = '1.0.0';
-
-/** Human-readable statement embedded in the canonical StepFi challenge envelope. */
-const CHALLENGE_STATEMENT =
-  'StepFi requests that you sign this message to authenticate your wallet. ' +
-  'This message does not trigger any blockchain transaction.';
-
-/** Fallback network passphrase — matches the rest of the codebase. */
-const DEFAULT_NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
-
-/**
- * End of the documented migration window for the legacy raw-nonce signature
- * scheme (issue #118). This cutoff is ENFORCED at runtime: once the date has
- * passed, legacy raw-nonce signatures are rejected even while
- * AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still true, so the replayable scheme
- * closes automatically without relying on an operator flipping the flag.
- * Overridable via AUTH_LEGACY_SIGNATURES_SUNSET (e.g. to close the window
- * early or to extend it in an emergency).
- */
-export const LEGACY_RAW_SIGNATURES_SUNSET = '2026-10-31';
-
-/** Shape of a nonces row as read by verifySignature. */
-interface StoredNonce {
-  id: string;
-  expires_at: string;
-  issued_at: string | null;
-  message_hash: string | null;
-}
-
-/** Parsed fields of the canonical challenge envelope used for validation. */
-interface ChallengeEnvelope {
-  domain: string;
-  address: string;
-  uri: string;
-  version: string;
-  nonce: string;
-  issuedAt: string;
-  expirationTime: string;
-  networkPassphrase: string;
-}
-
-/**
- * Parses a boolean-ish environment value. Returns `defaultValue` when the
- * value is unset or empty; accepts true/1/yes/on (case-insensitive).
- */
-function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
-  if (value === undefined || value.trim() === '') return defaultValue;
-  return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase());
+interface RefreshTokenPayload {
+  type?: string;
+  wallet?: string;
+  fam?: string;
 }
 
 export interface RegisterResponse extends AuthResponseDto {
@@ -96,82 +46,51 @@ export interface RegisterResponse extends AuthResponseDto {
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
-  /** Host that must appear in the challenge envelope's `domain` field. */
-  private readonly challengeDomain: string;
-
-  /** API URI that must appear in the challenge envelope's `uri` field. */
-  private readonly challengeUri: string;
-
-  /** Stellar network passphrase bound into the challenge envelope. */
-  private readonly networkPassphrase: string;
-
-  /**
-   * Whether the deprecated raw-nonce signature scheme (no domain binding) is
-   * still accepted during the migration window. Defaults to true for
-   * mobile-client compatibility. Even when true, the scheme is rejected once
-   * the runtime-enforced sunset (legacySignaturesSunset) has passed.
-   */
-  private readonly allowLegacyRawSignatures: boolean;
-
-  /**
-   * Hard cutoff for the legacy raw-nonce scheme (UTC). After this instant
-   * legacy signatures are rejected regardless of allowLegacyRawSignatures,
-   * so the vulnerable path cannot outlive the documented migration window.
-   */
-  private readonly legacySignaturesSunset: Date;
-
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly usersRepository: UsersRepository,
-  ) {
-    const apiUrl = (this.configService.get<string>('API_URL') ?? 'http://localhost:3000').replace(/\/+$/, '');
-    const apiPrefix = this.configService.get<string>('API_PREFIX') ?? 'api/v1';
-    this.challengeDomain = this.configService.get<string>('AUTH_CHALLENGE_DOMAIN') ?? this.resolveHost(apiUrl);
-    this.challengeUri = `${apiUrl}/${apiPrefix}/auth/verify`;
-    this.networkPassphrase =
-      this.configService.get<string>('STELLAR_NETWORK_PASSPHRASE') ?? DEFAULT_NETWORK_PASSPHRASE;
-    this.allowLegacyRawSignatures = parseBooleanEnv(
-      this.configService.get<string>('AUTH_ALLOW_LEGACY_RAW_SIGNATURES'),
-      true,
-    );
-    this.legacySignaturesSunset = this.resolveLegacySunset(
-      this.configService.get<string>('AUTH_LEGACY_SIGNATURES_SUNSET'),
-    );
-  }
+    private readonly auditService: AuditService,
+  ) {}
 
   async register(dto: RegisterRequestDto, profileImage?: UploadedAvatarFile): Promise<RegisterResponse> {
-    const existingWallet = await this.usersRepository.findByWallet(dto.walletAddress);
-    if (existingWallet) {
-      throw new ConflictException({ code: 'AUTH_WALLET_EXISTS', message: 'Wallet address is already registered.' });
-    }
-    const usernameTaken = await this.usersRepository.checkUsernameExists(dto.username);
-    if (usernameTaken) {
-      throw new ConflictException({ code: 'AUTH_USERNAME_TAKEN', message: 'Username is already taken.' });
-    }
     let avatarUrl: string | null = null;
-    if (profileImage) {
-      avatarUrl = await this.usersRepository.uploadAvatar(dto.walletAddress, profileImage);
+    let createdUserId: string | null = null;
+    try {
+      if (profileImage) {
+        avatarUrl = await this.usersRepository.uploadAvatar(dto.walletAddress, profileImage);
+      }
+      const user = await this.usersRepository.createProfile({
+        wallet: dto.walletAddress,
+        username: dto.username,
+        displayName: dto.displayName,
+        avatarUrl,
+      });
+      createdUserId = user.id;
+
+      const tokens = await this.generateTokens(dto.walletAddress);
+
+      return {
+        user: {
+          id: user.id,
+          walletAddress: user.wallet_address,
+          username: user.username,
+          displayName: user.display_name,
+          avatarUrl: user.avatar_url,
+          createdAt: user.created_at,
+        },
+        ...tokens,
+      };
+    } catch (error) {
+      if (avatarUrl) {
+        await this.usersRepository.deleteAvatar(avatarUrl).catch(() => {});
+      }
+      if (createdUserId) {
+        await this.usersRepository.deleteUserById(createdUserId).catch(() => {});
+      }
+      throw error;
     }
-    const user = await this.usersRepository.createProfile({
-      wallet: dto.walletAddress,
-      username: dto.username,
-      displayName: dto.displayName,
-      avatarUrl,
-    });
-    const tokens = await this.generateTokens(dto.walletAddress);
-    return {
-      user: {
-        id: user.id,
-        walletAddress: user.wallet_address,
-        username: user.username,
-        displayName: user.display_name,
-        avatarUrl: user.avatar_url,
-        createdAt: user.created_at,
-      },
-      ...tokens,
-    };
   }
 
   /**
@@ -473,7 +392,7 @@ export class AuthService {
     return { id: user.id, role: user.role ?? null };
   }
 
-  async generateTokens(wallet: string): Promise<AuthResponseDto> {
+  async generateTokens(wallet: string, familyId?: string): Promise<AuthResponseDto> {
     const { id: userId, role } = await this.findOrCreateUser(wallet);
     const client = this.supabaseService.getServiceRoleClient();
     // Role is read fresh from the users table on every token generation,
@@ -482,8 +401,11 @@ export class AuthService {
       { wallet, type: 'access', role },
       { secret: this.configService.get<string>('JWT_SECRET'), expiresIn: ACCESS_TOKEN_EXPIRATION },
     );
+    // All tokens minted from one login (or any of its refreshes) share a
+    // family id, enabling theft containment when a rotated token is replayed.
+    const sessionFamilyId = familyId ?? randomUUID();
     const refreshToken = this.jwtService.sign(
-      { wallet, type: 'refresh' },
+      { wallet, type: 'refresh', fam: sessionFamilyId },
       { secret: this.configService.get<string>('JWT_REFRESH_SECRET'), expiresIn: REFRESH_TOKEN_EXPIRATION },
     );
     const refreshTokenHash = createHash('sha256').update(refreshToken).digest('hex');
@@ -491,6 +413,7 @@ export class AuthService {
     const { error: sessionError } = await client.from('sessions').insert({
       user_id: userId,
       refresh_token_hash: refreshTokenHash,
+      family_id: sessionFamilyId,
       expires_at: refreshExpiresAt.toISOString(),
     });
     if (sessionError) {
@@ -500,7 +423,7 @@ export class AuthService {
   }
 
   async refreshTokens(refreshToken: string): Promise<AuthResponseDto> {
-    let payload: { type?: string; wallet?: string };
+    let payload: RefreshTokenPayload;
     try {
       payload = this.jwtService.verify(refreshToken, {
         secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
@@ -515,16 +438,64 @@ export class AuthService {
     const tokenHash = createHash('sha256').update(refreshToken).digest('hex');
     const { data: session, error } = await client
       .from('sessions')
-      .select('id, expires_at')
+      .select('id, family_id, expires_at')
       .eq('refresh_token_hash', tokenHash)
       .single();
     if (error || !session) {
+      await this.handleRefreshReplay(payload);
+      // Tokens minted before session families existed fall back to the
+      // original error so legacy clients see a stable response shape.
+      if (payload.fam) {
+        throw new UnauthorizedException({
+          code: 'AUTH_REFRESH_TOKEN_REUSED',
+          message: 'Refresh token reuse detected. All sessions have been revoked. Please sign in again.',
+        });
+      }
       throw new UnauthorizedException({ code: 'AUTH_SESSION_NOT_FOUND', message: 'Session not found. Please sign in again.' });
     }
     if (new Date(session.expires_at) < new Date()) {
       throw new UnauthorizedException({ code: 'AUTH_SESSION_EXPIRED', message: 'Session expired. Please sign in again.' });
     }
     await client.from('sessions').delete().eq('id', session.id);
-    return this.generateTokens(payload.wallet);
+    return this.generateTokens(payload.wallet as string, session.family_id);
+  }
+
+  /**
+   * A validly-signed refresh token whose session row no longer exists means
+   * the token was already rotated — i.e. it is being replayed, most likely
+   * by an attacker who stole it. Contain the compromise by revoking every
+   * session in the family and recording a security audit event.
+   */
+  private async handleRefreshReplay(payload: RefreshTokenPayload): Promise<void> {
+    const familyId = payload.fam;
+    const wallet = payload.wallet ?? 'unknown';
+    this.logger.error(`Refresh token replay detected for wallet ${wallet}${familyId ? ` (family ${familyId})` : ''}`);
+    if (!familyId) {
+      // Legacy token minted before families existed — nothing to revoke.
+      return;
+    }
+    const client = this.supabaseService.getServiceRoleClient();
+    const { error: revokeError, count } = await client
+      .from('sessions')
+      .delete({ count: 'exact' })
+      .eq('family_id', familyId);
+    if (revokeError) {
+      this.logger.error(`Failed to revoke session family ${familyId}: ${revokeError.message}`);
+    } else {
+      this.logger.error(`Revoked ${count ?? 0} session(s) in family ${familyId} after refresh-token replay`);
+    }
+    try {
+      await this.auditService.logWithBeforeAfter({
+        actorWallet: wallet,
+        action: 'auth.refresh_token_reuse',
+        resource: 'session',
+        resourceId: null,
+        beforeState: null,
+        afterState: { revoked_sessions: count ?? 0 },
+        metadata: { family_id: familyId },
+      });
+    } catch (auditError) {
+      this.logger.error('Failed to write refresh-token-reuse audit log', auditError);
+    }
   }
 }
