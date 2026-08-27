@@ -6,6 +6,7 @@ import { createHash } from 'crypto';
 import { AuthService } from '../../../../src/modules/auth/auth.service';
 import { SupabaseService } from '../../../../src/database/supabase.client';
 import { UsersRepository } from '../../../../src/database/repositories/users.repository';
+import { AuditService } from '../../../../src/modules/admin/audit.service';
 import { VerifyRequestDto } from '../../../../src/modules/auth/dto/verify-request.dto';
 
 // Mock Stellar SDK to avoid real crypto operations in unit tests
@@ -108,6 +109,7 @@ describe('AuthService', () => {
       mockJwtService as unknown as JwtService,
       config as unknown as ConfigService,
       mockUsersRepository as unknown as UsersRepository,
+      { log: jest.fn(), logWithBeforeAfter: jest.fn() } as unknown as AuditService,
     );
   }
 
@@ -143,6 +145,7 @@ describe('AuthService', () => {
         { provide: JwtService, useValue: mockJwtService },
         { provide: ConfigService, useValue: mockConfigService },
         { provide: UsersRepository, useValue: mockUsersRepository },
+        { provide: AuditService, useValue: { log: jest.fn(), logWithBeforeAfter: jest.fn() } },
       ],
     }).compile();
 

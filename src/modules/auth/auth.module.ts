@@ -9,6 +9,7 @@ import { ApiKeyGuard } from '../../auth/guards/api-key.guard';
 import { SupabaseService } from '../../database/supabase.client';
 import { UsersRepository } from '../../database/repositories/users.repository';
 import { getJwtConfig } from '../../config/jwt.config';
+import { AuditService } from '../admin/audit.service';
 
 @Module({
   imports: [
@@ -20,7 +21,7 @@ import { getJwtConfig } from '../../config/jwt.config';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtStrategy, ApiKeyGuard, SupabaseService, ConfigService, UsersRepository],
+  providers: [AuthService, JwtStrategy, ApiKeyGuard, SupabaseService, ConfigService, UsersRepository, AuditService],
   exports: [AuthService, JwtStrategy, ApiKeyGuard, PassportModule],
 })
 export class AuthModule {}

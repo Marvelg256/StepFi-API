@@ -11,6 +11,7 @@ import { createHash, randomBytes } from 'crypto';
 import { Keypair, StrKey } from 'stellar-sdk';
 import { SupabaseService } from '../../database/supabase.client';
 import { UsersRepository, UploadedAvatarFile } from '../../database/repositories/users.repository';
+import { AuditService } from '../admin/audit.service';
 import { NonceResponseDto } from './dto/nonce-response.dto';
 import { VerifyRequestDto } from './dto/verify-request.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
@@ -125,6 +126,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly usersRepository: UsersRepository,
+    private readonly auditService: AuditService,
   ) {
     const apiUrl = (this.configService.get<string>('API_URL') ?? 'http://localhost:3000').replace(/\/+$/, '');
     const apiPrefix = this.configService.get<string>('API_PREFIX') ?? 'api/v1';
