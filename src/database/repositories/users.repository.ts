@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, ConflictException } from '@nestjs/common';
 import { SupabaseService } from '../supabase.client';
 import { UpdateUserDto } from '../../modules/users/dto/update-user.dto';
 
@@ -226,6 +226,31 @@ export class UsersRepository {
         return (data as { wallet_address: string; role: UserRole } | null) ?? null;
     }
 
+    /**
+     * Admin override: sets or resets the user's role regardless of whether a role was set previously.
+     * Returns the updated user row, or null if the user does not exist.
+     */
+    async forceSetRole(
+        wallet: string,
+        role: UserRole | null,
+    ): Promise<{ wallet_address: string; role: UserRole | null } | null> {
+        const { data, error } = await this.supabaseService
+            .getServiceRoleClient()
+            .from('users')
+            .update({ role })
+            .eq('wallet_address', wallet)
+            .select('wallet_address, role')
+            .maybeSingle();
+
+        if (error) {
+            throw new InternalServerErrorException({
+                code: 'DATABASE_ROLE_UPDATE_FAILED',
+                message: 'Failed to update user role.',
+            });
+        }
+        return (data as { wallet_address: string; role: UserRole | null } | null) ?? null;
+    }
+
     // --- REGISTRATION METHODS ---
 
     async checkUsernameExists(username: string): Promise<boolean> {
@@ -260,6 +285,19 @@ export class UsersRepository {
             .single();
 
         if (error) {
+            const combinedErr = `${error.code || ''} ${error.message || ''} ${error.details || ''} ${error.hint || ''}`;
+            if (error.code === '23505' || combinedErr.includes('duplicate key') || combinedErr.includes('unique constraint')) {
+                if (combinedErr.includes('username')) {
+                    throw new ConflictException({
+                        code: 'AUTH_USERNAME_TAKEN',
+                        message: 'Username is already taken.',
+                    });
+                }
+                throw new ConflictException({
+                    code: 'AUTH_WALLET_EXISTS',
+                    message: 'Wallet address is already registered.',
+                });
+            }
             throw new InternalServerErrorException({
                 code: 'DATABASE_INSERT_ERROR',
                 message: `Failed to create user profile: ${error.message}`,
@@ -292,4 +330,25 @@ export class UsersRepository {
         const { data } = client.storage.from('avatars').getPublicUrl(fileName);
         return data.publicUrl;
     }
+
+    async deleteAvatar(avatarUrl: string): Promise<void> {
+        try {
+            const fileName = avatarUrl.substring(avatarUrl.lastIndexOf('/') + 1);
+            if (!fileName) return;
+            const client = this.supabaseService.getServiceRoleClient();
+            await client.storage.from('avatars').remove([fileName]);
+        } catch {
+            // Ignore cleanup failures
+        }
+    }
+
+    async deleteUserById(id: string): Promise<void> {
+        try {
+            const client = this.supabaseService.getServiceRoleClient();
+            await client.from('users').delete().eq('id', id);
+        } catch {
+            // Ignore cleanup failures
+        }
+    }
 }
+
