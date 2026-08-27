@@ -59,8 +59,9 @@ describe('AuthService', () => {
     getServiceRoleClient: jest.fn(() => mockSupabaseClient),
   };
 
-  const mockJwtService = {
+  const mockJwtService: { sign: jest.Mock; verify: jest.Mock } = {
     sign: jest.fn().mockReturnValue('mock.jwt.token'),
+    verify: jest.fn(),
   };
 
   const mockConfigService = {
@@ -72,6 +73,13 @@ describe('AuthService', () => {
     checkUsernameExists: jest.fn(),
     uploadAvatar: jest.fn(),
     createProfile: jest.fn(),
+    deleteAvatar: jest.fn(),
+    deleteUserById: jest.fn(),
+  };
+
+  const mockAuditService = {
+    log: jest.fn().mockResolvedValue(undefined),
+    logWithBeforeAfter: jest.fn().mockResolvedValue(undefined),
   };
 
   const validWallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
@@ -145,7 +153,7 @@ describe('AuthService', () => {
         { provide: JwtService, useValue: mockJwtService },
         { provide: ConfigService, useValue: mockConfigService },
         { provide: UsersRepository, useValue: mockUsersRepository },
-        { provide: AuditService, useValue: { log: jest.fn(), logWithBeforeAfter: jest.fn() } },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     }).compile();
 
@@ -643,13 +651,51 @@ describe('AuthService', () => {
       );
     });
 
-    it('should sign refresh token with payload { wallet, type: refresh } and 7d expiration', async () => {
+    it('should sign refresh token with payload { wallet, type: refresh, fam } and 7d expiration', async () => {
       setupMocks();
       await service.generateTokens(validWallet);
 
       expect(mockJwtService.sign).toHaveBeenCalledWith(
-        { wallet: validWallet, type: 'refresh' },
+        { wallet: validWallet, type: 'refresh', fam: expect.any(String) },
         expect.objectContaining({ expiresIn: '7d' }),
+      );
+    });
+
+    it('should store session row with the same family_id embedded in the refresh token', async () => {
+      const sessionInsert = jest.fn().mockResolvedValue({ error: null });
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'users') {
+          const chain: Record<string, jest.Mock> = {
+            upsert: jest.fn(),
+            select: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: { id: 'user-uuid', status: 'active' }, error: null }),
+          };
+          chain.upsert.mockReturnValue(chain);
+          chain.select.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'learner_profiles') {
+          const chain: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            maybeSingle: jest.fn().mockResolvedValue({ data: null, error: null }),
+            insert: jest.fn().mockResolvedValue({ error: null }),
+          };
+          chain.select.mockReturnValue(chain);
+          chain.eq.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'sessions') {
+          return { insert: sessionInsert };
+        }
+        return { insert: mockInsert };
+      });
+
+      await service.generateTokens(validWallet);
+
+      const refreshCall = mockJwtService.sign.mock.calls.find((c) => c[0].type === 'refresh');
+      expect(sessionInsert).toHaveBeenCalledWith(
+        expect.objectContaining({ family_id: refreshCall?.[0].fam }),
       );
     });
 
@@ -703,6 +749,8 @@ describe('AuthService', () => {
       mockUsersRepository.checkUsernameExists.mockResolvedValue(false);
       mockUsersRepository.createProfile.mockResolvedValue(mockUser);
       mockUsersRepository.uploadAvatar.mockResolvedValue('https://example.com/avatar.png');
+      mockUsersRepository.deleteAvatar.mockResolvedValue(undefined);
+      mockUsersRepository.deleteUserById.mockResolvedValue(undefined);
 
       // Mock findOrCreateUser internal behavior via Supabase mock
       mockFrom.mockImplementation((table: string) => {
@@ -737,8 +785,6 @@ describe('AuthService', () => {
     it('should register a new user successfully without image', async () => {
       const result = await service.register(registerDto);
 
-      expect(mockUsersRepository.findByWallet).toHaveBeenCalledWith(validWallet);
-      expect(mockUsersRepository.checkUsernameExists).toHaveBeenCalledWith('testuser');
       expect(mockUsersRepository.createProfile).toHaveBeenCalledWith({
         wallet: validWallet,
         username: 'testuser',
@@ -762,21 +808,280 @@ describe('AuthService', () => {
       expect(result.user.avatarUrl).toBe('https://example.com/avatar.png');
     });
 
-    it('should throw ConflictException if wallet already exists', async () => {
-      mockUsersRepository.findByWallet.mockResolvedValue({ id: 'existing' });
+    it('should throw ConflictException (AUTH_WALLET_EXISTS) if DB unique constraint on wallet is violated', async () => {
+      mockUsersRepository.createProfile.mockRejectedValueOnce(
+        new ConflictException({ code: 'AUTH_WALLET_EXISTS', message: 'Wallet address is already registered.' }),
+      );
 
-      await expect(service.register(registerDto)).rejects.toThrow(ConflictException);
       await expect(service.register(registerDto)).rejects.toMatchObject({
         response: { code: 'AUTH_WALLET_EXISTS' },
       });
     });
 
-    it('should throw ConflictException if username is taken', async () => {
-      mockUsersRepository.checkUsernameExists.mockResolvedValue(true);
+    it('should throw ConflictException (AUTH_USERNAME_TAKEN) if DB unique constraint on username is violated', async () => {
+      mockUsersRepository.createProfile.mockRejectedValueOnce(
+        new ConflictException({ code: 'AUTH_USERNAME_TAKEN', message: 'Username is already taken.' }),
+      );
 
-      await expect(service.register(registerDto)).rejects.toThrow(ConflictException);
       await expect(service.register(registerDto)).rejects.toMatchObject({
         response: { code: 'AUTH_USERNAME_TAKEN' },
+      });
+    });
+
+    it('should handle parallel duplicate-wallet registrations yielding exactly one success and one 409 AUTH_WALLET_EXISTS', async () => {
+      mockUsersRepository.createProfile
+        .mockResolvedValueOnce(mockUser)
+        .mockRejectedValueOnce(
+          new ConflictException({ code: 'AUTH_WALLET_EXISTS', message: 'Wallet address is already registered.' }),
+        );
+
+      const [res1, res2] = await Promise.allSettled([
+        service.register(registerDto),
+        service.register(registerDto),
+      ]);
+
+      const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled');
+      const rejected = [res1, res2].filter((r) => r.status === 'rejected');
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      if (rejected[0].status === 'rejected') {
+        expect(rejected[0].reason).toBeInstanceOf(ConflictException);
+        expect((rejected[0].reason as ConflictException).getResponse()).toEqual({
+          code: 'AUTH_WALLET_EXISTS',
+          message: 'Wallet address is already registered.',
+        });
+      }
+    });
+
+    it('should handle parallel duplicate-username registrations yielding exactly one success and one 409 AUTH_USERNAME_TAKEN', async () => {
+      const dto2 = { ...registerDto, walletAddress: 'GDIFFERENTWALLETHDHSKDHFKSHDFKSHDFKSHDFKSHDFKSH' };
+
+      mockUsersRepository.createProfile
+        .mockResolvedValueOnce(mockUser)
+        .mockRejectedValueOnce(
+          new ConflictException({ code: 'AUTH_USERNAME_TAKEN', message: 'Username is already taken.' }),
+        );
+
+      const [res1, res2] = await Promise.allSettled([
+        service.register(registerDto),
+        service.register(dto2),
+      ]);
+
+      const fulfilled = [res1, res2].filter((r) => r.status === 'fulfilled');
+      const rejected = [res1, res2].filter((r) => r.status === 'rejected');
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      if (rejected[0].status === 'rejected') {
+        expect(rejected[0].reason).toBeInstanceOf(ConflictException);
+        expect((rejected[0].reason as ConflictException).getResponse()).toEqual({
+          code: 'AUTH_USERNAME_TAKEN',
+          message: 'Username is already taken.',
+        });
+      }
+    });
+
+    it('should return same structured 409 AUTH_WALLET_EXISTS on sequential re-registration', async () => {
+      // First registration succeeds
+      await service.register(registerDto);
+
+      // Second registration fails on unique constraint
+      mockUsersRepository.createProfile.mockRejectedValueOnce(
+        new ConflictException({ code: 'AUTH_WALLET_EXISTS', message: 'Wallet address is already registered.' }),
+      );
+
+      await expect(service.register(registerDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_WALLET_EXISTS' },
+      });
+    });
+
+    it('should clean up avatar from storage when registration fails after avatar upload', async () => {
+      const mockFile = { originalname: 'avatar.png', buffer: Buffer.from('test'), mimetype: 'image/png' };
+      mockUsersRepository.uploadAvatar.mockResolvedValue('https://example.com/avatar.png');
+      mockUsersRepository.createProfile.mockRejectedValueOnce(
+        new ConflictException({ code: 'AUTH_WALLET_EXISTS', message: 'Wallet address is already registered.' }),
+      );
+
+      await expect(service.register(registerDto, mockFile)).rejects.toThrow(ConflictException);
+
+      expect(mockUsersRepository.deleteAvatar).toHaveBeenCalledWith('https://example.com/avatar.png');
+    });
+
+    it('should clean up both avatar and created user if downstream token issuance fails', async () => {
+      const mockFile = { originalname: 'avatar.png', buffer: Buffer.from('test'), mimetype: 'image/png' };
+      mockUsersRepository.uploadAvatar.mockResolvedValue('https://example.com/avatar.png');
+      mockUsersRepository.createProfile.mockResolvedValue(mockUser);
+
+      // Mock session creation failure during generateTokens
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'users') {
+          return {
+            upsert: jest.fn().mockReturnThis(),
+            select: jest.fn().mockReturnThis(),
+            single: jest.fn().mockResolvedValue({ data: { id: 'user-uuid', status: 'active' }, error: null }),
+          };
+        }
+        if (table === 'learner_profiles') {
+          return {
+            select: jest.fn().mockReturnThis(),
+            eq: jest.fn().mockReturnThis(),
+            maybeSingle: jest.fn().mockResolvedValue({ data: null, error: null }),
+            insert: jest.fn().mockResolvedValue({ error: null }),
+          };
+        }
+        if (table === 'sessions') {
+          return { insert: jest.fn().mockResolvedValue({ error: { message: 'Session failed' } }) };
+        }
+        return { insert: mockInsert };
+      });
+
+      await expect(service.register(registerDto, mockFile)).rejects.toThrow(InternalServerErrorException);
+
+      expect(mockUsersRepository.deleteAvatar).toHaveBeenCalledWith('https://example.com/avatar.png');
+      expect(mockUsersRepository.deleteUserById).toHaveBeenCalledWith('user-uuid');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // refreshTokens — rotation within session family + replay detection
+  // ---------------------------------------------------------------------------
+  describe('refreshTokens', () => {
+    const refreshToken = 'valid.refresh.token';
+    const tokenHash = createHash('sha256').update(refreshToken).digest('hex');
+    const familyId = '11111111-2222-3333-4444-555555555555';
+    const futureExpiry = new Date(Date.now() + 60 * 1000).toISOString();
+
+    function setupSessionMocks({
+      payload = { wallet: validWallet, type: 'refresh', fam: familyId } as Record<string, string>,
+      sessionLookup = { data: { id: 'session-uuid', family_id: familyId, expires_at: futureExpiry }, error: null },
+      userStatus = 'active',
+    } = {}) {
+      const deleteEq = jest.fn().mockResolvedValue({ error: null, count: 1 });
+      const deleteFn = jest.fn().mockReturnValue({ eq: deleteEq });
+      mockJwtService.verify.mockReturnValue(payload);
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'users') {
+          const chain: Record<string, jest.Mock> = {
+            upsert: jest.fn(),
+            select: jest.fn(),
+            single: jest.fn().mockResolvedValue({ data: { id: 'user-uuid', status: userStatus }, error: null }),
+          };
+          chain.upsert.mockReturnValue(chain);
+          chain.select.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'learner_profiles') {
+          const chain: Record<string, jest.Mock> = {
+            select: jest.fn(),
+            eq: jest.fn(),
+            maybeSingle: jest.fn().mockResolvedValue({ data: null, error: null }),
+            insert: jest.fn().mockResolvedValue({ error: null }),
+          };
+          chain.select.mockReturnValue(chain);
+          chain.eq.mockReturnValue(chain);
+          return chain;
+        }
+        if (table === 'sessions') {
+          return {
+            select: jest.fn().mockReturnThis(),
+            eq: jest.fn().mockReturnThis(),
+            single: jest.fn().mockResolvedValue(sessionLookup),
+            insert: jest.fn().mockResolvedValue({ error: null }),
+            delete: deleteFn,
+          };
+        }
+        return { insert: mockInsert };
+      });
+      return { deleteFn, deleteEq };
+    }
+
+    beforeEach(() => {
+      mockConfigService.get.mockImplementation((key: string) =>
+        key === 'JWT_REFRESH_SECRET' ? 'refresh-secret' : 'mock-secret',
+      );
+      mockJwtService.verify.mockReturnValue({ wallet: validWallet, type: 'refresh', fam: familyId });
+    });
+
+    it('should rotate tokens into the same session family', async () => {
+      setupSessionMocks();
+
+      await service.refreshTokens(refreshToken);
+
+      const refreshCall = mockJwtService.sign.mock.calls.find((c) => c[0].type === 'refresh');
+      expect(refreshCall?.[0]).toMatchObject({ wallet: validWallet, fam: familyId });
+    });
+
+    it('should delete the presented session row on successful rotation', async () => {
+      const { deleteEq } = setupSessionMocks();
+
+      await service.refreshTokens(refreshToken);
+
+      expect(deleteEq).toHaveBeenCalledWith('id', 'session-uuid');
+    });
+
+    it('should revoke the entire family and write an audit event when a rotated token is replayed', async () => {
+      // Session row is gone — the token was already rotated.
+      const { deleteFn } = setupSessionMocks({
+        sessionLookup: { data: null, error: { message: 'No rows found' } },
+      });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_REFRESH_TOKEN_REUSED' },
+      });
+
+      expect(deleteFn).toHaveBeenCalledWith({ count: 'exact' });
+      expect(mockAuditService.logWithBeforeAfter).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorWallet: validWallet,
+          action: 'auth.refresh_token_reuse',
+          resource: 'session',
+          metadata: { family_id: familyId },
+        }),
+      );
+    });
+
+    it('should throw AUTH_SESSION_NOT_FOUND for an unknown legacy token without a family claim', async () => {
+      setupSessionMocks({
+        payload: { wallet: validWallet, type: 'refresh' },
+        sessionLookup: { data: null, error: { message: 'No rows found' } },
+      });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_SESSION_NOT_FOUND' },
+      });
+      // No family claim → nothing to revoke, no audit event for the family.
+      expect(mockAuditService.logWithBeforeAfter).not.toHaveBeenCalled();
+    });
+
+    it('should throw AUTH_SESSION_EXPIRED when the session row exists but has expired', async () => {
+      setupSessionMocks({
+        sessionLookup: {
+          data: { id: 'session-uuid', family_id: familyId, expires_at: new Date(Date.now() - 1000).toISOString() },
+          error: null,
+        },
+      });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_SESSION_EXPIRED' },
+      });
+    });
+
+    it('should throw AUTH_USER_BLOCKED when refreshing for a blocked user', async () => {
+      setupSessionMocks({ userStatus: 'blocked' });
+
+      await expect(service.refreshTokens(refreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_USER_BLOCKED' },
+      });
+    });
+
+    it('should throw AUTH_REFRESH_TOKEN_INVALID when JWT verification fails', async () => {
+      mockJwtService.verify.mockImplementation(() => {
+        throw new Error('jwt expired');
+      });
+
+      await expect(service.refreshTokens('garbage')).rejects.toMatchObject({
+        response: { code: 'AUTH_REFRESH_TOKEN_INVALID' },
       });
     });
   });
