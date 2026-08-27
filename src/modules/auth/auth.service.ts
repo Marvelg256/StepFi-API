@@ -43,8 +43,12 @@ const DEFAULT_NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
 
 /**
  * End of the documented migration window for the legacy raw-nonce signature
- * scheme (issue #118). After this date AUTH_ALLOW_LEGACY_RAW_SIGNATURES must
- * be disabled; see docs/setup/environment-variables.md.
+ * scheme (issue #118). This cutoff is ENFORCED at runtime: once the date has
+ * passed, legacy raw-nonce signatures are rejected even while
+ * AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still true, so the replayable scheme
+ * closes automatically without relying on an operator flipping the flag.
+ * Overridable via AUTH_LEGACY_SIGNATURES_SUNSET (e.g. to close the window
+ * early or to extend it in an emergency).
  */
 export const LEGACY_RAW_SIGNATURES_SUNSET = '2026-10-31';
 
@@ -104,9 +108,17 @@ export class AuthService {
   /**
    * Whether the deprecated raw-nonce signature scheme (no domain binding) is
    * still accepted during the migration window. Defaults to true for
-   * mobile-client compatibility; MUST be disabled at the documented sunset.
+   * mobile-client compatibility. Even when true, the scheme is rejected once
+   * the runtime-enforced sunset (legacySignaturesSunset) has passed.
    */
   private readonly allowLegacyRawSignatures: boolean;
+
+  /**
+   * Hard cutoff for the legacy raw-nonce scheme (UTC). After this instant
+   * legacy signatures are rejected regardless of allowLegacyRawSignatures,
+   * so the vulnerable path cannot outlive the documented migration window.
+   */
+  private readonly legacySignaturesSunset: Date;
 
   constructor(
     private readonly supabaseService: SupabaseService,
@@ -123,6 +135,9 @@ export class AuthService {
     this.allowLegacyRawSignatures = parseBooleanEnv(
       this.configService.get<string>('AUTH_ALLOW_LEGACY_RAW_SIGNATURES'),
       true,
+    );
+    this.legacySignaturesSunset = this.resolveLegacySunset(
+      this.configService.get<string>('AUTH_LEGACY_SIGNATURES_SUNSET'),
     );
   }
 
@@ -321,7 +336,10 @@ export class AuthService {
   /**
    * Legacy verification: raw Ed25519 over the nonce hex bytes. No domain
    * binding — accepted only while AUTH_ALLOW_LEGACY_RAW_SIGNATURES is
-   * enabled (migration window; see LEGACY_RAW_SIGNATURES_SUNSET).
+   * enabled AND the runtime-enforced sunset (legacySignaturesSunset) has not
+   * passed. The sunset check runs before any signature verification, so the
+   * replayable scheme closes automatically on LEGACY_RAW_SIGNATURES_SUNSET
+   * even if an operator never flips the flag (issue #118).
    */
   private verifyLegacyRawSignature(keypair: Keypair, nonce: string, signatureBuffer: Buffer): void {
     if (!this.allowLegacyRawSignatures) {
@@ -332,13 +350,44 @@ export class AuthService {
           'Please sign the canonical challenge message returned by POST /auth/nonce.',
       });
     }
+    if (Date.now() >= this.legacySignaturesSunset.getTime()) {
+      this.logger.warn(
+        `Rejecting legacy raw nonce signature: the migration window closed on ` +
+          `${LEGACY_RAW_SIGNATURES_SUNSET}. AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still enabled but ` +
+          'the scheme is hard-disabled; flip the flag to false to silence this warning.',
+      );
+      throw new UnauthorizedException({
+        code: 'AUTH_LEGACY_SIGNATURE_DISABLED',
+        message:
+          `Legacy raw nonce signatures were disabled on ${LEGACY_RAW_SIGNATURES_SUNSET}. ` +
+          'Please sign the canonical challenge message returned by POST /auth/nonce.',
+      });
+    }
     this.logger.warn(
       `Legacy raw nonce signature accepted — AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still enabled. ` +
-        `Disable it after ${LEGACY_RAW_SIGNATURES_SUNSET}.`,
+        `The scheme is hard-disabled at runtime after ${LEGACY_RAW_SIGNATURES_SUNSET}.`,
     );
     if (!keypair.verify(Buffer.from(nonce), signatureBuffer)) {
       throw new UnauthorizedException({ code: 'AUTH_SIGNATURE_INVALID', message: 'Invalid signature.' });
     }
+  }
+
+  /**
+   * Resolves the legacy signature sunset as a UTC Date. Falls back to
+   * LEGACY_RAW_SIGNATURES_SUNSET when the env var is unset or malformed, so
+   * a bad value can never silently disable the cutoff.
+   */
+  private resolveLegacySunset(raw: string | undefined): Date {
+    if (raw !== undefined && raw.trim() !== '') {
+      const parsed = new Date(raw);
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed;
+      }
+      this.logger.warn(
+        `Ignoring invalid AUTH_LEGACY_SIGNATURES_SUNSET="${raw}"; falling back to ${LEGACY_RAW_SIGNATURES_SUNSET}.`,
+      );
+    }
+    return new Date(`${LEGACY_RAW_SIGNATURES_SUNSET}T00:00:00.000Z`);
   }
 
   /**

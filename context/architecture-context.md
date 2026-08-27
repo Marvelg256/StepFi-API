@@ -92,7 +92,9 @@ Wallet address → `POST /auth/nonce` → client signs nonce with wallet →
   native clients sign the envelope with raw Ed25519
   (`signatureType: 'envelope'`)
 - The legacy raw-nonce scheme is deprecated behind
-  `AUTH_ALLOW_LEGACY_RAW_SIGNATURES` (sunset 2026-10-31)
+  `AUTH_ALLOW_LEGACY_RAW_SIGNATURES` and hard-disabled at runtime after
+  `AUTH_LEGACY_SIGNATURES_SUNSET` (default 2026-10-31), so the replayable
+  path closes automatically at the sunset even if the flag is left true
 - Nonces are single-use and expired by the `nonce-cleanup` cron
 
 ---

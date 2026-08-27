@@ -74,8 +74,10 @@ tries multiple formats):
   `SHA-256("Stellar Signed Message:\n" + envelope)` (SEP-53).
 - `raw` — **deprecated** legacy scheme: raw Ed25519 over the bare nonce hex.
   Only accepted while `AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true` (migration
-  window, sunset **2026-10-31**). Once disabled, requests using it fail with
-  `AUTH_LEGACY_SIGNATURE_DISABLED`.
+  window, sunset **2026-10-31**). The sunset is enforced at runtime: after
+  that date legacy signatures are rejected with
+  `AUTH_LEGACY_SIGNATURE_DISABLED` even if the flag is still true (override
+  via `AUTH_LEGACY_SIGNATURES_SUNSET`).
 
 `message` is optional: when omitted, the server reconstructs the canonical
 challenge from the stored nonce row. Either way the signature is verified

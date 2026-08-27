@@ -75,6 +75,42 @@ describe('AuthService', () => {
 
   const validWallet = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW';
 
+  /**
+   * Builds an AuthService with a ConfigService whose `get` returns the given
+   * overrides on top of the default test configuration.
+   */
+  function createServiceWithConfig(overrides: Record<string, unknown> = {}): AuthService {
+    const config = {
+      get: jest.fn((key: string) => {
+        if (key in overrides) {
+          return overrides[key];
+        }
+        switch (key) {
+          case 'API_URL':
+            return 'http://localhost:3000';
+          case 'API_PREFIX':
+            return 'api/v1';
+          case 'STELLAR_NETWORK_PASSPHRASE':
+            return NETWORK_PASSPHRASE;
+          case 'AUTH_CHALLENGE_DOMAIN':
+            return undefined;
+          case 'AUTH_ALLOW_LEGACY_RAW_SIGNATURES':
+            return undefined; // default: legacy accepted during migration window
+          case 'AUTH_LEGACY_SIGNATURES_SUNSET':
+            return undefined; // default: LEGACY_RAW_SIGNATURES_SUNSET (2026-10-31)
+          default:
+            return 'mock-secret';
+        }
+      }),
+    };
+    return new AuthService(
+      mockSupabaseService as unknown as SupabaseService,
+      mockJwtService as unknown as JwtService,
+      config as unknown as ConfigService,
+      mockUsersRepository as unknown as UsersRepository,
+    );
+  }
+
   /** Config mock matching the constructor's expectations. */
   function configureConfigService() {
     mockConfigService.get.mockImplementation((key: string) => {
@@ -89,6 +125,8 @@ describe('AuthService', () => {
           return undefined;
         case 'AUTH_ALLOW_LEGACY_RAW_SIGNATURES':
           return undefined; // default: legacy accepted during migration window
+        case 'AUTH_LEGACY_SIGNATURES_SUNSET':
+          return undefined; // default: LEGACY_RAW_SIGNATURES_SUNSET (2026-10-31)
         default:
           return 'mock-secret';
       }
@@ -372,33 +410,47 @@ describe('AuthService', () => {
     });
 
     it('should reject legacy raw nonce signatures when AUTH_ALLOW_LEGACY_RAW_SIGNATURES is false', async () => {
-      const flagOffConfig = {
-        get: jest.fn((key: string) => {
-          switch (key) {
-            case 'API_URL':
-              return 'http://localhost:3000';
-            case 'API_PREFIX':
-              return 'api/v1';
-            case 'STELLAR_NETWORK_PASSPHRASE':
-              return NETWORK_PASSPHRASE;
-            case 'AUTH_ALLOW_LEGACY_RAW_SIGNATURES':
-              return 'false';
-            default:
-              return 'mock-secret';
-          }
-        }),
-      };
-      const serviceWithLegacyOff = new AuthService(
-        mockSupabaseService as unknown as SupabaseService,
-        mockJwtService as unknown as JwtService,
-        flagOffConfig as unknown as ConfigService,
-        mockUsersRepository as unknown as UsersRepository,
-      );
-      setupMocks();
+      const serviceWithLegacyOff = createServiceWithConfig({ AUTH_ALLOW_LEGACY_RAW_SIGNATURES: 'false' });
+      // A signature that WOULD verify (mock verify returns true) — the guard
+      // must reject it purely because the legacy scheme is disabled.
+      const { mockKeypair } = setupMocks({ signatureValid: true });
+      const legacyDto: VerifyRequestDto = { ...validDto, signatureType: 'raw' };
 
-      await expect(serviceWithLegacyOff.verifySignature(validDto)).rejects.toMatchObject({
+      await expect(serviceWithLegacyOff.verifySignature(legacyDto)).rejects.toMatchObject({
         response: { code: 'AUTH_LEGACY_SIGNATURE_DISABLED' },
       });
+      expect(mockKeypair.verify).not.toHaveBeenCalled();
+    });
+
+    it('should reject legacy raw nonce signatures after the sunset date even when the flag is still true', async () => {
+      // AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true but the sunset has passed — the
+      // runtime cutoff must close the replayable scheme anyway (issue #118).
+      const servicePastSunset = createServiceWithConfig({
+        AUTH_ALLOW_LEGACY_RAW_SIGNATURES: 'true',
+        AUTH_LEGACY_SIGNATURES_SUNSET: '2020-01-01',
+      });
+      const { mockKeypair } = setupMocks({ signatureValid: true });
+      const legacyDto: VerifyRequestDto = { ...validDto, signatureType: 'raw' };
+
+      await expect(servicePastSunset.verifySignature(legacyDto)).rejects.toMatchObject({
+        response: { code: 'AUTH_LEGACY_SIGNATURE_DISABLED' },
+      });
+      expect(mockKeypair.verify).not.toHaveBeenCalled();
+    });
+
+    it('should accept legacy raw nonce signatures while the flag is true and the sunset is in the future', async () => {
+      const serviceFutureSunset = createServiceWithConfig({
+        AUTH_ALLOW_LEGACY_RAW_SIGNATURES: 'true',
+        AUTH_LEGACY_SIGNATURES_SUNSET: '2999-01-01',
+      });
+      const { mockKeypair } = setupMocks();
+      const legacyDto: VerifyRequestDto = { ...validDto, signatureType: 'raw' };
+
+      await expect(serviceFutureSunset.verifySignature(legacyDto)).resolves.toBeUndefined();
+      expect(mockKeypair.verify).toHaveBeenCalledWith(
+        Buffer.from(validNonce),
+        Buffer.from(validSignature, 'base64'),
+      );
     });
 
     // --- canonical envelope: native (signatureType 'envelope') --------------

@@ -94,19 +94,29 @@ AUTH_CHALLENGE_DOMAIN=stepfi-api.onrender.com
 
 # Whether the deprecated legacy raw-nonce signature scheme (signature over
 # the bare nonce hex, no domain binding) is still accepted. Defaults to true
-# during the documented migration window; MUST be set to false after the
-# sunset date (2026-10-31). When false, legacy requests fail with
+# during the documented migration window; set to false to disable it
+# immediately. When false, legacy requests fail with
 # AUTH_LEGACY_SIGNATURE_DISABLED.
 AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true
+
+# Hard cutoff (YYYY-MM-DD) for the legacy raw-nonce scheme. After this date
+# legacy signatures are rejected with AUTH_LEGACY_SIGNATURE_DISABLED even
+# while AUTH_ALLOW_LEGACY_RAW_SIGNATURES is still true, so the migration
+# window closes automatically at the sunset — no manual ops action required.
+# Defaults to 2026-10-31. Override to close the window early or (in an
+# emergency) to extend it. Malformed values fall back to the default.
+AUTH_LEGACY_SIGNATURES_SUNSET=2026-10-31
 ```
 
 **Migration window**: existing mobile clients sign the bare nonce. They must
 be updated to sign the canonical challenge envelope returned by
 `POST /auth/nonce` (`signatureType: "envelope"`). Until the sunset date
 (**2026-10-31**) the legacy scheme remains accepted while
-`AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true`; after that date the flag must be
-flipped to `false` (or removed) and only domain-bound signatures are
-accepted.
+`AUTH_ALLOW_LEGACY_RAW_SIGNATURES=true`; after that date the legacy scheme
+is rejected **at runtime** (the sunset is enforced in code, not just
+documented), so only domain-bound signatures are accepted even if the flag
+was never flipped. Set `AUTH_ALLOW_LEGACY_RAW_SIGNATURES=false`
+immediately if you do not need the migration window at all.
 
 ### Redis (Caching)
 
